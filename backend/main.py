@@ -20,10 +20,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Define a simple console print tool
+def print_message_to_console(message: str) -> dict:
+    """Print a message to the console/terminal"""
+    print(f"🖨️  CONSOLE MESSAGE: {message}")
+    return {"status": "success", "message": f"Printed: {message}"}
+
 class GeminiConnection:
     def __init__(self):
         self.api_key = os.environ.get("GEMINI_API_KEY")
-        self.model = "gemini-2.0-flash-exp"
+        # Use the correct model for Live API with function calling
+        self.model = "gemini-2.0-flash-live-001"
         self.uri = (
             "wss://generativelanguage.googleapis.com/ws/"
             "google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent"
@@ -39,7 +46,29 @@ class GeminiConnection:
         if not self.config:
             raise ValueError("Configuration must be set before connecting")
 
-        # Send initial setup message with configuration
+        # Define tool declarations according to the official Live API format
+        tools = [
+            {
+                "function_declarations": [
+                    {
+                        "name": "print_message_to_console",
+                        "description": "Print a message to the console/terminal. Use this when the user asks you to print something or display a message.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "message": {
+                                    "type": "string",
+                                    "description": "The message to print to the console"
+                                }
+                            },
+                            "required": ["message"]
+                        }
+                    }
+                ]
+            }
+        ]
+
+        # Send initial setup message with configuration and tools
         setup_message = {
             "setup": {
                 "model": f"models/{self.model}",
@@ -59,7 +88,8 @@ class GeminiConnection:
                             "text": self.config["systemPrompt"]
                         }
                     ]
-                }
+                },
+                "tools": tools
             }
         }
         await self.ws.send(json.dumps(setup_message))
@@ -123,6 +153,15 @@ class GeminiConnection:
             }
         }
         await self.ws.send(json.dumps(text_message))
+
+    async def send_tool_response(self, function_responses: list):
+        """Send tool response back to Gemini using the correct Live API format"""
+        tool_response_message = {
+            "tool_response": {
+                "function_responses": function_responses
+            }
+        }
+        await self.ws.send(json.dumps(tool_response_message))
 
 # Store active connections
 connections: Dict[str, GeminiConnection] = {}
@@ -199,6 +238,38 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
 
                     msg = await gemini.receive()
                     response = json.loads(msg)
+                    
+                    # Handle tool calls - check for the correct Live API format
+                    if "toolCall" in response:
+                        tool_call = response["toolCall"]
+                        function_calls = tool_call.get("functionCalls", [])
+                        
+                        function_responses = []
+                        for fc in function_calls:
+                            if fc.get("name") == "print_message_to_console":
+                                # Execute the print function
+                                message = fc.get("args", {}).get("message", "")
+                                result = print_message_to_console(message)
+                                
+                                # Create function response in the correct format
+                                function_response = {
+                                    "id": fc.get("id"),
+                                    "name": fc.get("name"),
+                                    "response": {"result": result}
+                                }
+                                function_responses.append(function_response)
+                                
+                                # Forward tool call info to client
+                                await websocket.send_json({
+                                    "type": "tool_call",
+                                    "tool_name": "print_message_to_console",
+                                    "message": message,
+                                    "result": result
+                                })
+                        
+                        # Send all function responses back to Gemini
+                        if function_responses:
+                            await gemini.send_tool_response(function_responses)
                     
                     # Forward audio data to client
                     try:
